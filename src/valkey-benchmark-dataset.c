@@ -1014,23 +1014,27 @@ static bool loadDatasetRecords(dataset *ds, int verbose) {
                     break;
                 }
                 
-                /* Extract each field, strip null padding from string fields */
-                record->fields = zmalloc(sizeof(sds) * ds->field_count);
+                /* Extract each field into its mapped destination slot.
+                 * This mirrors CSV loading: field_map[src] = dest index in record->fields.
+                 * Fields with field_map[i] == -1 are unused and skipped. */
+                record->fields = zmalloc(sizeof(sds) * ds->used_field_count);
                 for (int i = 0; i < ds->field_count; i++) {
+                    int dest = ds->field_map ? ds->field_map[i] : i;
+                    if (dest < 0) continue;  /* field not referenced in any placeholder */
+
                     char *field_data = record_buf + ds->field_offsets[i];
                     size_t field_size = ds->field_sizes[i];
-                    
-                    /* Detect string fields by size (not vector/float) and strip nulls */
+
+                    /* String fields: strip null padding to get actual length.
+                     * Binary/vector fields: use full size as-is. */
                     if (field_size < 256 && field_size != 4) {
-                        /* String field - find actual length by searching for first null */
                         size_t actual_len = 0;
                         while (actual_len < field_size && field_data[actual_len] != '\0') {
                             actual_len++;
                         }
-                        record->fields[i] = sdsnewlen(field_data, actual_len);
+                        record->fields[dest] = sdsnewlen(field_data, actual_len);
                     } else {
-                        /* Binary field (vector/float) - use full size */
-                        record->fields[i] = sdsnewlen(field_data, field_size);
+                        record->fields[dest] = sdsnewlen(field_data, field_size);
                     }
                 }
                 zfree(record_buf);
