@@ -33,7 +33,9 @@ static bool csvDiscoverFields(dataset *ds);
 static bool scanXmlFieldsFromFile(dataset *ds, const char *xml_root_element);
 static bool scanXmlFields(const char *doc_start, const char *doc_end, dataset *ds, const char *start_root_tag, const char *end_root_tag);
 static bool loadXmlDataset(dataset *ds, const char *xml_root_element, int verbose);
-static bool csvLoadDocuments(dataset *ds);
+static bool loadDatasetRecords(dataset *ds, int verbose);
+static bool parseNpyHeader(FILE *fp, int *rows, int *cols, bool *is_structured);
+static bool parseStructuredNpy(FILE *fp, dataset *ds, int *rows);
 static bool shouldStopLoading(dataset *ds);
 static int findFieldIndex(dataset *ds, const char *field_name, size_t field_name_len);
 static const char *extractDatasetFieldValue(dataset *ds, int field_idx, int record_index);
@@ -71,7 +73,10 @@ dataset *datasetInit(const char *filename, const char *xml_root_element, int max
     }
 
     /* Detect format */
-    if (strstr(filename, ".csv")) {
+    if (strstr(filename, ".npy")) {
+        ds->format = DATASET_FORMAT_NPY;
+        ds->delimiter = 0;
+    } else if (strstr(filename, ".csv")) {
         ds->format = DATASET_FORMAT_CSV;
         ds->delimiter = ',';
     } else if (strstr(filename, ".tsv")) {
@@ -86,7 +91,32 @@ dataset *datasetInit(const char *filename, const char *xml_root_element, int max
     }
 
     /* Discover fields */
-    if (ds->format == DATASET_FORMAT_XML) {
+    if (ds->format == DATASET_FORMAT_NPY) {
+        /* Check if structured by peeking at header */
+        FILE *peek_fp = fopen(filename, "r");
+        if (peek_fp) {
+            int rows, cols;
+            bool is_structured_peek;
+            if (parseNpyHeader(peek_fp, &rows, &cols, &is_structured_peek)) {
+                if (is_structured_peek) {
+                    /* Structured NPY - parse dtype for fields */
+                    parseStructuredNpy(peek_fp, ds, &rows);
+                } else {
+                    /* Simple NPY - single vector field */
+                    ds->field_names = zmalloc(1 * sizeof(sds));
+                    ds->field_names[0] = sdsnew("vector");
+                    ds->field_count = 1;
+                }
+            }
+            fclose(peek_fp);
+        }
+        if (!ds->field_names) {
+            /* Fallback if peek failed */
+            ds->field_names = zmalloc(1 * sizeof(sds));
+            ds->field_names[0] = sdsnew("vector");
+            ds->field_count = 1;
+        }
+    } else if (ds->format == DATASET_FORMAT_XML) {
         if (!scanXmlFieldsFromFile(ds, xml_root_element)) goto error;
     } else {
         if (!csvDiscoverFields(ds)) goto error;
@@ -103,7 +133,8 @@ dataset *datasetInit(const char *filename, const char *xml_root_element, int max
     if (ds->format == DATASET_FORMAT_XML) {
         if (!loadXmlDataset(ds, xml_root_element, verbose)) goto error;
     } else {
-        if (!csvLoadDocuments(ds)) goto error;
+        /* Unified loader for CSV/TSV/NPY */
+        if (!loadDatasetRecords(ds, verbose)) goto error;
     }
 
     return ds;
@@ -117,7 +148,6 @@ void datasetFree(dataset *ds) {
     if (!ds) return;
 
     if (ds->field_names) {
-        /* Unified memory management: all formats use zmalloc + individual sdsnew */
         for (int i = 0; i < ds->field_count; i++) {
             sdsfree(ds->field_names[i]);
         }
@@ -126,6 +156,14 @@ void datasetFree(dataset *ds) {
 
     if (ds->field_map) {
         zfree(ds->field_map);
+    }
+    
+    if (ds->field_offsets) {
+        zfree(ds->field_offsets);
+    }
+    
+    if (ds->field_sizes) {
+        zfree(ds->field_sizes);
     }
 
     if (ds->records) {
@@ -217,17 +255,21 @@ sds datasetGenerateCommand(dataset *ds, int record_index, sds *template_argv, in
     if (!ds || !template_argv) return NULL;
 
     sds *processed_argv = zmalloc(template_argc * sizeof(sds));
+    size_t *argvlen = zmalloc(template_argc * sizeof(size_t));
+    
     for (int i = 0; i < template_argc; i++) {
         processed_argv[i] = processFieldsInArg(ds, sdsdup(template_argv[i]), record_index);
+        argvlen[i] = sdslen(processed_argv[i]);  /* Binary-safe lengths */
     }
 
     char *cmd = NULL;
-    int len = valkeyFormatCommandArgv(&cmd, template_argc, (const char **)processed_argv, NULL);
+    int len = valkeyFormatCommandArgv(&cmd, template_argc, (const char **)processed_argv, argvlen);
     if (len == -1) {
         for (int i = 0; i < template_argc; i++) {
             sdsfree(processed_argv[i]);
         }
         zfree(processed_argv);
+        zfree(argvlen);
         if (cmd) {
             free(cmd);
         }
@@ -243,6 +285,7 @@ sds datasetGenerateCommand(dataset *ds, int record_index, sds *template_argv, in
         sdsfree(processed_argv[i]);
     }
     zfree(processed_argv);
+    zfree(argvlen);
 
     return result;
 }
@@ -292,6 +335,232 @@ static sds formatBytes(size_t bytes) {
     } else {
         return sdscatprintf(sdsempty(), "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
     }
+}
+
+/* Parse a single dtype field entry like ('name', 'S50') or ('name', '<f4', (256,))
+ * Returns field size in bytes, or 0 on failure. */
+static size_t parseDtypeFieldSize(const char *type_str, size_t type_len) {
+    /* Skip leading whitespace, quotes, angle brackets, endian markers */
+    while (type_len > 0 && (*type_str == '\'' || *type_str == '"' ||
+                             *type_str == '<'  || *type_str == '>' ||
+                             *type_str == '='  || *type_str == '|' ||
+                             *type_str == ' ')) {
+        type_str++;
+        type_len--;
+    }
+    if (type_len == 0) return 0;
+
+    char kind = type_str[0];
+    size_t elem_size = 0;
+
+    if (kind == 'S' || kind == 'U' || kind == 'V') {
+        /* String/bytes/void: number after kind is byte count */
+        elem_size = (size_t)atoi(type_str + 1);
+        if (kind == 'U') elem_size *= 4; /* Unicode: 4 bytes per char */
+    } else if (kind == 'f') {
+        elem_size = (size_t)atoi(type_str + 1);
+    } else if (kind == 'i' || kind == 'u') {
+        elem_size = (size_t)atoi(type_str + 1);
+    } else if (kind == 'b') {
+        elem_size = 1;
+    }
+
+    return elem_size;
+}
+
+/* Dynamic structured NPY parser - reads field layout from the dtype descriptor in the header.
+ * Works with any structured NPY file regardless of field types or count. */
+static bool parseStructuredNpy(FILE *fp, dataset *ds, int *rows) {
+    fseek(fp, 0, SEEK_SET);
+
+    char magic[6];
+    fread(magic, 1, 6, fp);
+
+    unsigned char version[2];
+    fread(version, 1, 2, fp);
+
+    unsigned int header_len;
+    if (version[0] == 1) {
+        unsigned short len16;
+        fread(&len16, 1, 2, fp);
+        header_len = len16;
+    } else {
+        fread(&header_len, 1, 4, fp);
+    }
+
+    char *header = zmalloc(header_len + 1);
+    fread(header, 1, header_len, fp);
+    header[header_len] = '\0';
+
+    /* Get row count from shape */
+    char *shape_start = strstr(header, "'shape':");
+    if (!shape_start) shape_start = strstr(header, "\"shape\":");
+    if (!shape_start || !strchr(shape_start, '(')) {
+        zfree(header);
+        return false;
+    }
+    sscanf(strchr(shape_start, '('), "(%d,)", rows);
+
+    /* Find the dtype list: 'descr': [(...), (...), ...] */
+    char *descr_start = strstr(header, "'descr':");
+    if (!descr_start) descr_start = strstr(header, "\"descr\":");
+    if (!descr_start) { zfree(header); return false; }
+
+    char *list_start = strchr(descr_start, '[');
+    char *list_end = strchr(descr_start, ']');
+    if (!list_start || !list_end || list_start >= list_end) {
+        zfree(header);
+        return false;
+    }
+
+    /* Count fields (count opening parens at top level) */
+    int field_count = 0;
+    for (char *p = list_start + 1; p < list_end; p++) {
+        if (*p == '(') field_count++;
+    }
+    if (field_count == 0 || field_count > MAX_DATASET_FIELDS) {
+        zfree(header);
+        return false;
+    }
+
+    ds->field_names   = zmalloc(field_count * sizeof(sds));
+    ds->field_offsets = zmalloc(field_count * sizeof(size_t));
+    ds->field_sizes   = zmalloc(field_count * sizeof(size_t));
+    ds->field_count   = 0;
+
+    size_t current_offset = 0;
+    char *p = list_start + 1;
+
+    while (p < list_end && ds->field_count < field_count) {
+        /* Find next '(' */
+        while (p < list_end && *p != '(') p++;
+        if (p >= list_end) break;
+        p++; /* skip '(' */
+
+        /* Extract field name (quoted string) */
+        while (p < list_end && *p != '\'' && *p != '"') p++;
+        if (p >= list_end) break;
+        char quote = *p++;
+        char *name_start = p;
+        while (p < list_end && *p != quote) p++;
+        size_t name_len = p - name_start;
+        if (name_len == 0 || name_len > MAX_FIELD_NAME_LEN) { p++; continue; }
+        p++; /* skip closing quote */
+
+        /* Skip comma and whitespace */
+        while (p < list_end && (*p == ',' || *p == ' ')) p++;
+
+        /* Extract type string (quoted) */
+        while (p < list_end && *p != '\'' && *p != '"') p++;
+        if (p >= list_end) break;
+        char tquote = *p++;
+        char *type_start = p;
+        while (p < list_end && *p != tquote) p++;
+        size_t type_len = p - type_start;
+        p++; /* skip closing quote */
+
+        /* Parse element size from type string */
+        size_t elem_size = parseDtypeFieldSize(type_start, type_len);
+        if (elem_size == 0) { continue; }
+
+        /* Check for shape tuple e.g. , (256,) after type */
+        size_t total_size = elem_size;
+        char *after_type = p;
+        while (after_type < list_end && (*after_type == ',' || *after_type == ' ')) after_type++;
+        if (after_type < list_end && *after_type == '(') {
+            /* Shape tuple: multiply element size */
+            int dim = atoi(after_type + 1);
+            if (dim > 0) total_size = elem_size * (size_t)dim;
+        }
+
+        /* Store field */
+        int idx = ds->field_count;
+        ds->field_names[idx]   = sdsnewlen(name_start, name_len);
+        ds->field_offsets[idx] = current_offset;
+        ds->field_sizes[idx]   = total_size;
+        current_offset += total_size;
+        ds->field_count++;
+
+        /* Advance past closing ')' */
+        while (p < list_end && *p != ')') p++;
+        if (p < list_end) p++;
+    }
+
+    ds->record_size = current_offset;
+
+    zfree(header);
+
+    if (ds->field_count == 0) {
+        fprintf(stderr, "Error: No fields parsed from structured NPY dtype\n");
+        return false;
+    }
+
+    return true;
+}
+
+/* NPY format parser - reads numpy array header */
+static bool parseNpyHeader(FILE *fp, int *rows, int *cols, bool *is_structured) {
+    char magic[6];
+    if (fread(magic, 1, 6, fp) != 6) return false;
+    if (memcmp(magic, "\x93NUMPY", 6) != 0) {
+        fprintf(stderr, "Error: Invalid NPY magic bytes\n");
+        return false;
+    }
+    
+    unsigned char version[2];
+    if (fread(version, 1, 2, fp) != 2) return false;
+    
+    unsigned int header_len;
+    if (version[0] == 1) {
+        unsigned short len16;
+        if (fread(&len16, 1, 2, fp) != 2) return false;
+        header_len = len16;
+    } else {
+        if (fread(&header_len, 1, 4, fp) != 4) return false;
+    }
+    
+    char *header = zmalloc(header_len + 1);
+    if (fread(header, 1, header_len, fp) != header_len) {
+        zfree(header);
+        return false;
+    }
+    header[header_len] = '\0';
+    
+    char *dtype_start = strstr(header, "'descr':");
+    if (!dtype_start) dtype_start = strstr(header, "\"descr\":");
+    *is_structured = (dtype_start && strchr(dtype_start, '[') != NULL);
+    
+    char *shape_start = strstr(header, "'shape':");
+    if (!shape_start) shape_start = strstr(header, "\"shape\":");
+    if (!shape_start) {
+        fprintf(stderr, "Error: NPY header missing 'shape'\n");
+        zfree(header);
+        return false;
+    }
+    
+    char *tuple_start = strchr(shape_start, '(');
+    if (!tuple_start) {
+        zfree(header);
+        return false;
+    }
+    
+    if (*is_structured) {
+        if (sscanf(tuple_start, "(%d,)", rows) != 1) {
+            fprintf(stderr, "Error: Could not parse structured NPY shape\n");
+            zfree(header);
+            return false;
+        }
+        *cols = 0;
+    } else {
+        if (sscanf(tuple_start, "(%d, %d)", rows, cols) != 2) {
+            fprintf(stderr, "Error: Could not parse NPY shape\n");
+            zfree(header);
+            return false;
+        }
+    }
+    
+    zfree(header);
+    return true;
 }
 
 static bool shouldStopLoading(dataset *ds) {
@@ -666,29 +935,56 @@ static bool loadXmlDataset(dataset *ds, const char *xml_root_element, int verbos
     return true;
 }
 
-static bool csvLoadDocuments(dataset *ds) {
+/* Unified record loader for CSV/TSV/NPY formats */
+static bool loadDatasetRecords(dataset *ds, int verbose) {
     FILE *fp = fopen(ds->filename, "r");
-    if (!fp) return false;
-
-    char *line = NULL;
-    size_t len = 0;
-    if (getline(&line, &len, fp) == -1) {
-        fprintf(stderr, "Cannot read header from dataset file\n");
-        free(line);
-        fclose(fp);
+    if (!fp) {
+        fprintf(stderr, "Cannot open dataset file: %s\n", ds->filename);
         return false;
     }
 
+    /* Format-specific header handling */
+    char *line = NULL;
+    size_t line_len = 0;
+    int npy_cols = 0;
+    size_t vec_size = 0;
+    
+    bool is_structured = false;
+    
+    if (ds->format == DATASET_FORMAT_NPY) {
+        int npy_rows;
+        if (!parseNpyHeader(fp, &npy_rows, &npy_cols, &is_structured)) {
+            fclose(fp);
+            return false;
+        }
+        
+        if (!is_structured) {
+            /* Simple NPY */
+            vec_size = npy_cols * sizeof(float);
+            if (verbose) {
+                fprintf(stderr, "Loading NPY: %d rows × %d dims\n", npy_rows, npy_cols);
+            }
+        } else if (verbose) {
+            fprintf(stderr, "Loading structured NPY: %d records\n", npy_rows);
+        }
+    } else {
+        /* CSV/TSV: Skip header line */
+        if (getline(&line, &line_len, fp) == -1) {
+            fprintf(stderr, "Cannot read CSV header\n");
+            free(line);
+            fclose(fp);
+            return false;
+        }
+    }
+
+    /* UNIFIED: Allocate records */
     size_t capacity = 1000;
     ds->records = zmalloc(sizeof(datasetRecord) * capacity);
 
-    const char *format_name = (ds->format == DATASET_FORMAT_CSV) ? "csv" : (ds->format == DATASET_FORMAT_TSV) ? "tsv"
-                                                                                                              : "xml";
-    (void)format_name; /* Suppress output in unit tests */
-
+    /* UNIFIED: Build load indices for CSV field mapping */
     int *load_indices = NULL;
     int load_count = 0;
-    if (ds->field_map) {
+    if (ds->field_map && ds->format != DATASET_FORMAT_NPY) {
         load_indices = zmalloc(ds->used_field_count * sizeof(int));
         for (int i = 0; i < ds->field_count; i++) {
             if (ds->field_map[i] >= 0) {
@@ -697,38 +993,105 @@ static bool csvLoadDocuments(dataset *ds) {
         }
     }
 
-    while (getline(&line, &len, fp) != -1 && !shouldStopLoading(ds)) {
-        if (line[0] == '\0' || line[0] == '\n') continue;
-
-        size_t line_len = strlen(line);
-        if (line_len > 0 && line[line_len - 1] == '\n') line[line_len - 1] = '\0';
-        if (line_len > 1 && line[line_len - 2] == '\r') line[line_len - 2] = '\0';
-
-        if (ds->record_count >= capacity) {
-            capacity *= 2;
-            ds->records = zrealloc(ds->records, sizeof(datasetRecord) * capacity);
-        }
-
-        datasetRecord *record = &ds->records[ds->record_count];
-        record->fields = zmalloc(sizeof(sds) * ds->used_field_count);
-
-        if (ds->field_map) {
-            for (int j = 0; j < load_count; j++) {
-                int orig_idx = load_indices[j];
-                int mapped_idx = ds->field_map[orig_idx];
-                record->fields[mapped_idx] = getFieldValue(line, orig_idx, ds->delimiter);
+    /* UNIFIED: Load loop */
+    while (!shouldStopLoading(ds)) {
+        /* Format-specific read */
+        bool read_success = false;
+        
+        if (ds->format == DATASET_FORMAT_NPY) {
+            if (ds->record_count >= capacity) {
+                capacity *= 2;
+                ds->records = zrealloc(ds->records, sizeof(datasetRecord) * capacity);
+            }
+            
+            datasetRecord *record = &ds->records[ds->record_count];
+            
+            if (is_structured) {
+                /* Structured: Read full record, extract fields by offset */
+                char *record_buf = zmalloc(ds->record_size);
+                if (fread(record_buf, 1, ds->record_size, fp) != ds->record_size) {
+                    zfree(record_buf);
+                    break;
+                }
+                
+                /* Extract each field, strip null padding from string fields */
+                record->fields = zmalloc(sizeof(sds) * ds->field_count);
+                for (int i = 0; i < ds->field_count; i++) {
+                    char *field_data = record_buf + ds->field_offsets[i];
+                    size_t field_size = ds->field_sizes[i];
+                    
+                    /* Detect string fields by size (not vector/float) and strip nulls */
+                    if (field_size < 256 && field_size != 4) {
+                        /* String field - find actual length by searching for first null */
+                        size_t actual_len = 0;
+                        while (actual_len < field_size && field_data[actual_len] != '\0') {
+                            actual_len++;
+                        }
+                        record->fields[i] = sdsnewlen(field_data, actual_len);
+                    } else {
+                        /* Binary field (vector/float) - use full size */
+                        record->fields[i] = sdsnewlen(field_data, field_size);
+                    }
+                }
+                zfree(record_buf);
+                read_success = true;
+            } else {
+                /* Simple: Single vector field */
+                record->fields = zmalloc(sizeof(sds) * 1);
+                record->fields[0] = sdsnewlen(NULL, vec_size);
+                if (fread(record->fields[0], 1, vec_size, fp) == vec_size) {
+                    read_success = true;
+                }
             }
         } else {
-            for (int i = 0; i < ds->field_count; i++) {
-                record->fields[i] = getFieldValue(line, i, ds->delimiter);
+            /* CSV/TSV text read */
+            if (getline(&line, &line_len, fp) == -1) break;
+            if (line[0] == '\0' || line[0] == '\n') continue;
+
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+            if (len > 1 && line[len - 2] == '\r') line[len - 2] = '\0';
+
+            if (ds->record_count >= capacity) {
+                capacity *= 2;
+                ds->records = zrealloc(ds->records, sizeof(datasetRecord) * capacity);
             }
+
+            datasetRecord *record = &ds->records[ds->record_count];
+            record->fields = zmalloc(sizeof(sds) * ds->used_field_count);
+
+            if (ds->field_map) {
+                for (int j = 0; j < load_count; j++) {
+                    int orig_idx = load_indices[j];
+                    int mapped_idx = ds->field_map[orig_idx];
+                    record->fields[mapped_idx] = getFieldValue(line, orig_idx, ds->delimiter);
+                }
+            } else {
+                for (int i = 0; i < ds->field_count; i++) {
+                    record->fields[i] = getFieldValue(line, i, ds->delimiter);
+                }
+            }
+            read_success = true;
         }
 
+        if (!read_success) break;
+        
         ds->record_count++;
+
+        /* UNIFIED: Progress logging */
+        if (verbose && ds->record_count % 10000 == 0) {
+            fprintf(stderr, "\rLoaded %zu records...", ds->record_count);
+            fflush(stderr);
+        }
     }
 
+    /* UNIFIED: Cleanup */
+    if (verbose) {
+        fprintf(stderr, "\rLoaded %zu records%*s\n", ds->record_count, 20, "");
+    }
+    
     if (load_indices) zfree(load_indices);
-    free(line);
+    if (line) free(line);
     fclose(fp);
     return true;
 }
@@ -784,11 +1147,12 @@ static sds processFieldsInArg(dataset *ds, sds arg, int record_index) {
         if (field_idx == -1) break;
 
         const char *field_value = extractDatasetFieldValue(ds, field_idx, record_index);
+        size_t field_value_len = sdslen(ds->records[record_index].fields[field_idx]);
         size_t before_len = field_pos - arg;
         const char *after_start = field_end + FIELD_SUFFIX_LEN;
 
         sds result = sdsnewlen(arg, before_len);
-        result = sdscat(result, field_value);
+        result = sdscatlen(result, field_value, field_value_len);  /* Binary-safe */
         result = sdscat(result, after_start);
 
         sdsfree(arg);

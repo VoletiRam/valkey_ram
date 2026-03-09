@@ -25,7 +25,8 @@
 typedef enum datasetFormat {
     DATASET_FORMAT_CSV = 0,
     DATASET_FORMAT_TSV,
-    DATASET_FORMAT_XML
+    DATASET_FORMAT_XML,
+    DATASET_FORMAT_NPY
 } datasetFormat;
 
 /* Dataset structures */
@@ -45,6 +46,9 @@ typedef struct dataset {
     const char *filename;
     const char *xml_root_element;
     int max_documents;
+    size_t *field_offsets;  /* For structured NPY: byte offset of each field */
+    size_t *field_sizes;    /* For structured NPY: byte size of each field */
+    size_t record_size;     /* For structured NPY: total bytes per record */
 } dataset;
 
 /* Initialize dataset from file - returns NULL on error */
